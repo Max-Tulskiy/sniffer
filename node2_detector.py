@@ -1,315 +1,440 @@
 #!/usr/bin/env python3
 """
-Узел №2 — Детектор сниффера в сети.
+Узел №2 — сетевой детектор снифферов по мотивам nmap sniffer-detect.nse.
 
-Методы обнаружения:
-  ICMP — отправляем ICMP Echo Request с поддельным MAC-адресом назначения.
-         Нормальный NIC отбросит фрейм (MAC не совпадает).
-         NIC в promiscuous-режиме передаёт ВСЕ фреймы в ядро,
-         и целевой хост отвечает на запрос → сниффер обнаружен.
+Идея проверки:
+  1. Находим живые хосты в указанной IPv4-подсети с помощью обычного ARP.
+  2. Для каждого хоста отправляем 8 ARP-запросов с разными Ethernet dst MAC.
+  3. Если цель отвечает на кадры, которые обычная NIC должна отбрасывать,
+     это может указывать на promiscuous mode.
 
-  ARP  — отправляем ARP Request с поддельным unicast MAC назначения
-         (не broadcast). Принцип тот же: только promiscuous NIC
-         передаст фрейм ядру, и хост ответит.
+Скрипт повторяет общую эвристику NSE-скрипта:
+  • сигнатуры тестов "11111111", "111___1_" и т.п.;
+  • 3 попытки на каждый тест;
+  • короткие таймауты ожидания ответа.
 
-Работа без внешних зависимостей (только stdlib Python 3).
-Требует запуска с правами root.
+Ограничения:
+  • только IPv4;
+  • только локальная L2-сеть;
+  • требуется root (raw socket).
 """
 
+from __future__ import annotations
+
+import argparse
+import fcntl
+import ipaddress
+import os
+import select
 import socket
 import struct
-import fcntl
-import os
 import sys
 import time
-import random
-import argparse
+from dataclasses import dataclass
 
+ETH_P_ARP = 0x0806
+ETH_P_ALL = 0x0003
+ARPOP_REQUEST = 1
+ARPOP_REPLY = 2
 SIOCGIFADDR = 0x8915
+SIOCGIFHWADDR = 0x8927
+
+TEST_DEST_MACS = (
+    b"\xff\xff\xff\xff\xff\xff",  # B32
+    b"\xff\xff\xff\xff\xff\xfe",  # B31
+    b"\xff\xff\x00\x00\x00\x00",  # B16
+    b"\xff\x00\x00\x00\x00\x00",  # B8
+    b"\x01\x00\x00\x00\x00\x00",  # G
+    b"\x01\x00\x5e\x00\x00\x00",  # M0
+    b"\x01\x00\x5e\x00\x00\x01",  # M1
+    b"\x01\x00\x5e\x00\x00\x03",  # M3
+)
+
+SIGNATURES = {
+    "1_____1_": ("not_promiscuous", None),
+    "1_______": ("not_promiscuous", None),
+    "1___1_1_": ("not_promiscuous", None),
+    "11111111": ("promiscuous", "Вероятно, интерфейс работает в неразборчивом режиме"),
+    "1_1___1_": ("ambiguous", "Windows с установленным libpcap; сниффер может работать, а может и нет"),
+    "111___1_": ("promiscuous", "Вероятно, интерфейс работает в неразборчивом режиме"),
+}
 
 
-class SnifferDetector:
-    # Fake MAC-адрес — unicast, не принадлежит ни одному устройству в сети
-    FAKE_MAC = "00:de:ad:be:ef:00"
+class DetectorError(RuntimeError):
+    """Ошибка настройки или сетевого ввода-вывода."""
 
+
+@dataclass
+class HostInfo:
+    ip: ipaddress.IPv4Address
+    mac: bytes
+
+    @property
+    def mac_text(self) -> str:
+        return format_mac(self.mac)
+
+
+@dataclass
+class ScanResult:
+    host: HostInfo
+    signature: str
+    verdict: str
+    suspicious: bool
+
+
+def format_mac(mac: bytes) -> str:
+    return ":".join(f"{part:02x}" for part in mac)
+
+
+def mac_from_text(mac: str) -> bytes:
+    return bytes(int(part, 16) for part in mac.split(":"))
+
+
+def get_interface_ipv4(interface: str) -> ipaddress.IPv4Address:
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        request = struct.pack("256s", interface.encode("utf-8")[:15])
+        response = fcntl.ioctl(sock.fileno(), SIOCGIFADDR, request)
+    except OSError as exc:
+        raise DetectorError(f"Не удалось получить IPv4 для интерфейса {interface}: {exc}") from exc
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+    return ipaddress.IPv4Address(response[20:24])
+
+
+def get_interface_mac(interface: str) -> bytes:
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        request = struct.pack("256s", interface.encode("utf-8")[:15])
+        response = fcntl.ioctl(sock.fileno(), SIOCGIFHWADDR, request)
+    except OSError as exc:
+        raise DetectorError(f"Не удалось получить MAC для интерфейса {interface}: {exc}") from exc
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+    return response[18:24]
+
+
+def build_arp_frame(dst_mac: bytes, src_mac: bytes, sender_ip: bytes, target_ip: bytes) -> bytes:
+    return (
+        dst_mac
+        + src_mac
+        + struct.pack("!H", ETH_P_ARP)
+        + struct.pack("!HHBBH", 1, 0x0800, 6, 4, ARPOP_REQUEST)
+        + src_mac
+        + sender_ip
+        + b"\x00" * 6
+        + target_ip
+    )
+
+
+def parse_arp_packet(frame: bytes) -> tuple[int, bytes, bytes, bytes, bytes] | None:
+    if len(frame) < 42:
+        return None
+    if struct.unpack("!H", frame[12:14])[0] != ETH_P_ARP:
+        return None
+    payload = frame[14:42]
+    htype, ptype, hlen, plen, oper = struct.unpack("!HHBBH", payload[:8])
+    if htype != 1 or ptype != 0x0800 or hlen != 6 or plen != 4:
+        return None
+    sender_mac = payload[8:14]
+    sender_ip = payload[14:18]
+    target_mac = payload[18:24]
+    target_ip = payload[24:28]
+    return oper, sender_mac, sender_ip, target_mac, target_ip
+
+
+class RawArpScanner:
     def __init__(self, interface: str):
         self.interface = interface
-        self.own_ip    = self._get_ip()
-        self.own_mac   = self._get_mac()
+        self.if_ip = get_interface_ipv4(interface)
+        self.if_ip_bytes = self.if_ip.packed
+        self.if_mac = get_interface_mac(interface)
+        self.sock = self._open_socket()
 
-    # ------------------------------------------------------------------ #
-    #  Вспомогательные методы                                             #
-    # ------------------------------------------------------------------ #
-
-    def _get_ip(self) -> str | None:
+    def _open_socket(self) -> socket.socket:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            res = fcntl.ioctl(s.fileno(), SIOCGIFADDR,
-                              struct.pack('256s', self.interface.encode()[:15]))
-            s.close()
-            return socket.inet_ntoa(res[20:24])
-        except Exception:
-            return None
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+            sock.bind((self.interface, 0))
+            sock.setblocking(False)
+        except PermissionError as exc:
+            raise DetectorError("Нужны права root: используйте sudo") from exc
+        except OSError as exc:
+            raise DetectorError(f"Не удалось открыть raw socket на {self.interface}: {exc}") from exc
+        return sock
 
-    def _get_mac(self) -> str | None:
-        try:
-            with open(f'/sys/class/net/{self.interface}/address') as f:
-                return f.read().strip()
-        except Exception:
-            return None
+    def close(self) -> None:
+        self.sock.close()
 
-    @staticmethod
-    def _mac_bytes(mac: str) -> bytes:
-        return bytes(int(x, 16) for x in mac.split(':'))
+    def _send(self, frame: bytes) -> None:
+        self.sock.send(frame)
 
-    @staticmethod
-    def _checksum(data: bytes) -> int:
-        if len(data) % 2:
-            data += b'\x00'
-        s = sum((data[i] << 8) + data[i + 1] for i in range(0, len(data), 2))
-        while s >> 16:
-            s = (s & 0xFFFF) + (s >> 16)
-        return ~s & 0xFFFF
+    def _recv_until(self, deadline: float) -> bytes | None:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([self.sock], [], [], remaining)
+            if not ready:
+                return None
+            try:
+                return self.sock.recv(65535)
+            except BlockingIOError:
+                continue
 
-    def _raw_sock(self, timeout: float = 3.0) -> socket.socket:
-        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-        s.bind((self.interface, 0))
-        s.settimeout(timeout)
-        return s
+    def _flush_matching(self, target: HostInfo, wait_seconds: float = 0.1) -> None:
+        deadline = time.monotonic() + wait_seconds
+        expected_l2 = self.if_mac + target.mac
+        while True:
+            frame = self._recv_until(deadline)
+            if frame is None:
+                return
+            if frame[:12] != expected_l2:
+                continue
 
-    # ------------------------------------------------------------------ #
-    #  ARP-резолюция (чтобы знать реальный MAC цели перед ICMP-тестом)   #
-    # ------------------------------------------------------------------ #
-
-    def _resolve_mac(self, target_ip: str, timeout: float = 3.0) -> str | None:
-        s = self._raw_sock(timeout)
-        try:
-            own_mac_b = self._mac_bytes(self.own_mac)
-            # Ethernet + ARP
-            arp_frame = (
-                b'\xff\xff\xff\xff\xff\xff'          # dst: broadcast
-                + own_mac_b                           # src
-                + struct.pack('!H', 0x0806)           # EtherType ARP
-                + struct.pack('!HHBBH',
-                              1, 0x0800, 6, 4, 1)    # hw=Eth, proto=IPv4, op=req
-                + own_mac_b
-                + socket.inet_aton(self.own_ip)
-                + b'\x00' * 6
-                + socket.inet_aton(target_ip)
+    def discover_hosts(
+        self,
+        network: ipaddress.IPv4Network,
+        per_host_delay: float = 0.002,
+        receive_timeout: float = 1.5,
+    ) -> list[HostInfo]:
+        hosts = [ip for ip in network.hosts() if ip != self.if_ip]
+        for host_ip in hosts:
+            frame = build_arp_frame(
+                b"\xff\xff\xff\xff\xff\xff",
+                self.if_mac,
+                self.if_ip_bytes,
+                host_ip.packed,
             )
-            s.send(arp_frame)
+            self._send(frame)
+            if per_host_delay > 0:
+                time.sleep(per_host_delay)
 
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    pkt = s.recv(65535)
-                    if struct.unpack('!H', pkt[12:14])[0] != 0x0806:
-                        continue
-                    arp = pkt[14:]
-                    if struct.unpack('!H', arp[6:8])[0] != 2:   # ARP Reply
-                        continue
-                    if socket.inet_ntoa(arp[14:18]) == target_ip:
-                        return ':'.join(f'{b:02x}' for b in arp[8:14])
-                except socket.timeout:
+        found: dict[ipaddress.IPv4Address, HostInfo] = {}
+        deadline = time.monotonic() + receive_timeout
+        while True:
+            frame = self._recv_until(deadline)
+            if frame is None:
+                break
+            parsed = parse_arp_packet(frame)
+            if not parsed:
+                continue
+            oper, sender_mac, sender_ip, _target_mac, target_ip = parsed
+            if oper != ARPOP_REPLY:
+                continue
+            if target_ip != self.if_ip_bytes:
+                continue
+            ip_addr = ipaddress.IPv4Address(sender_ip)
+            if ip_addr not in network or ip_addr == self.if_ip:
+                continue
+            found[ip_addr] = HostInfo(ip=ip_addr, mac=sender_mac)
+        return [found[ip_addr] for ip_addr in sorted(found)]
+
+    def do_test(self, target: HostInfo, dst_mac: bytes) -> str:
+        frame = build_arp_frame(dst_mac, self.if_mac, self.if_ip_bytes, target.ip.packed)
+        expected_l2 = self.if_mac + target.mac
+
+        for attempt in range(1, 4):
+            self._flush_matching(target, wait_seconds=0.1)
+            timeout = 0.010 * attempt * attempt
+            deadline = time.monotonic() + timeout
+            self._send(frame)
+
+            while True:
+                response = self._recv_until(deadline)
+                if response is None:
                     break
-        finally:
-            s.close()
-        return None
+                if response[:12] != expected_l2:
+                    continue
+                parsed = parse_arp_packet(response)
+                if not parsed:
+                    continue
+                oper, sender_mac, sender_ip, _target_mac, target_ip = parsed
+                if oper != ARPOP_REPLY:
+                    continue
+                if sender_mac != target.mac:
+                    continue
+                if sender_ip != target.ip.packed:
+                    continue
+                if target_ip != self.if_ip_bytes:
+                    continue
+                return "1"
+        return "_"
 
-    # ------------------------------------------------------------------ #
-    #  ICMP-метод                                                         #
-    # ------------------------------------------------------------------ #
+    def fingerprint_host(self, target: HostInfo) -> ScanResult:
+        signature = "".join(self.do_test(target, dst_mac) for dst_mac in TEST_DEST_MACS)
+        kind, message = SIGNATURES.get(signature, ("unknown", "Неизвестный результат"))
 
-    def _detect_icmp(self, target_ip: str) -> bool:
-        print(f"\n  [ICMP] Цель: {target_ip}  |  fake dst MAC: {self.FAKE_MAC}")
-
-        real_mac = self._resolve_mac(target_ip)
-        if not real_mac:
-            print(f"  [ICMP] Не удалось разрешить MAC для {target_ip} — пропуск")
-            return False
-        print(f"  [ICMP] Настоящий MAC цели : {real_mac}")
-        print(f"  [ICMP] MAC в Ethernet dst : {self.FAKE_MAC}  ← поддельный")
-
-        icmp_id  = random.randint(1, 0xFFFF)
-        icmp_seq = 1
-        icmp_body = b'DETECT_ICMP_PROBE'
-        raw_icmp = struct.pack('!BBHHH', 8, 0, 0, icmp_id, icmp_seq) + icmp_body
-        csum = self._checksum(raw_icmp)
-        icmp_pkt = struct.pack('!BBHHH', 8, 0, csum, icmp_id, icmp_seq) + icmp_body
-
-        ip_id  = random.randint(1, 0xFFFF)
-        ip_len = 20 + len(icmp_pkt)
-        ip_src = socket.inet_aton(self.own_ip)
-        ip_dst = socket.inet_aton(target_ip)
-        ip_hdr_no_cs = struct.pack('!BBHHHBBH4s4s',
-                                   0x45, 0, ip_len, ip_id, 0,
-                                   64, 1, 0, ip_src, ip_dst)
-        ip_cs = self._checksum(ip_hdr_no_cs)
-        ip_hdr = struct.pack('!BBHHHBBH4s4s',
-                             0x45, 0, ip_len, ip_id, 0,
-                             64, 1, ip_cs, ip_src, ip_dst)
-
-        frame = (
-            self._mac_bytes(self.FAKE_MAC)     # поддельный dst MAC
-            + self._mac_bytes(self.own_mac)
-            + struct.pack('!H', 0x0800)
-            + ip_hdr + icmp_pkt
-        )
-
-        s = self._raw_sock(3.0)
-        try:
-            s.send(frame)
-            print(f"  [ICMP] Запрос отправлен, ожидаем ответ (3 с)...")
-            deadline = time.time() + 3.0
-            while time.time() < deadline:
-                try:
-                    resp = s.recv(65535)
-                    if struct.unpack('!H', resp[12:14])[0] != 0x0800:
-                        continue
-                    rip = resp[14:]
-                    if rip[9] != 1:                         # не ICMP
-                        continue
-                    if socket.inet_ntoa(rip[12:16]) != target_ip:
-                        continue
-                    ihl = (rip[0] & 0xF) * 4
-                    ricmp = rip[ihl:]
-                    if ricmp[0] == 0:                       # Echo Reply
-                        rid = struct.unpack('!H', ricmp[4:6])[0]
-                        if rid == icmp_id:
-                            print(f"  [ICMP] *** ОТВЕТ ПОЛУЧЕН от {target_ip} ***")
-                            return True
-                except socket.timeout:
-                    break
-        finally:
-            s.close()
-
-        print(f"  [ICMP] Ответа нет — нормальный режим (или хост недоступен)")
-        return False
-
-    # ------------------------------------------------------------------ #
-    #  ARP-метод                                                          #
-    # ------------------------------------------------------------------ #
-
-    def _detect_arp(self, target_ip: str) -> bool:
-        print(f"\n  [ARP]  Цель: {target_ip}  |  fake dst MAC: {self.FAKE_MAC}")
-        print(f"  [ARP]  MAC в Ethernet dst : {self.FAKE_MAC}  ← поддельный (не broadcast)")
-
-        arp_frame = (
-            self._mac_bytes(self.FAKE_MAC)          # поддельный dst MAC
-            + self._mac_bytes(self.own_mac)
-            + struct.pack('!H', 0x0806)
-            + struct.pack('!HHBBH',
-                          1, 0x0800, 6, 4, 1)       # ARP Request
-            + self._mac_bytes(self.own_mac)
-            + socket.inet_aton(self.own_ip)
-            + b'\x00' * 6
-            + socket.inet_aton(target_ip)
-        )
-
-        s = self._raw_sock(3.0)
-        try:
-            s.send(arp_frame)
-            print(f"  [ARP]  Запрос отправлен, ожидаем ответ (3 с)...")
-            deadline = time.time() + 3.0
-            while time.time() < deadline:
-                try:
-                    resp = s.recv(65535)
-                    if struct.unpack('!H', resp[12:14])[0] != 0x0806:
-                        continue
-                    arp = resp[14:]
-                    if struct.unpack('!H', arp[6:8])[0] != 2:   # ARP Reply
-                        continue
-                    sender_ip  = socket.inet_ntoa(arp[14:18])
-                    sender_mac = ':'.join(f'{b:02x}' for b in arp[8:14])
-                    if sender_ip == target_ip:
-                        print(f"  [ARP]  *** ОТВЕТ ПОЛУЧЕН от {target_ip} ({sender_mac}) ***")
-                        return True
-                except socket.timeout:
-                    break
-        finally:
-            s.close()
-
-        print(f"  [ARP]  Ответа нет — нормальный режим (или хост недоступен)")
-        return False
-
-    # ------------------------------------------------------------------ #
-    #  Основная процедура                                                  #
-    # ------------------------------------------------------------------ #
-
-    def run(self, target_ip: str, repeat: int = 1) -> bool:
-        print(f"\n{'═'*60}")
-        print(f"  ПРОВЕРКА ХОСТА: {target_ip}")
-        print(f"  Интерфейс : {self.interface}")
-        print(f"  Наш IP    : {self.own_ip}")
-        print(f"  Наш MAC   : {self.own_mac}")
-        print(f"{'═'*60}")
-        print()
-        print("  Принцип: поддельный MAC назначения → нормальный NIC отбросит")
-        print("  фрейм; promiscuous NIC передаст его ядру → хост ответит.")
-
-        icmp_hits = 0
-        arp_hits  = 0
-
-        for i in range(repeat):
-            if repeat > 1:
-                print(f"\n{'─'*40}  попытка {i+1}/{repeat}")
-            if self._detect_icmp(target_ip):
-                icmp_hits += 1
-            time.sleep(0.3)
-            if self._detect_arp(target_ip):
-                arp_hits += 1
-
-        detected = icmp_hits > 0 or arp_hits > 0
-
-        print(f"\n{'═'*60}")
-        print("  ИТОГОВЫЙ РЕЗУЛЬТАТ")
-        print(f"{'═'*60}")
-        print(f"  Цель      : {target_ip}")
-        print(f"  ICMP тест : {'СНИФФЕР ОБНАРУЖЕН' if icmp_hits else 'не обнаружен':30s}"
-              f"  ({icmp_hits}/{repeat})")
-        print(f"  ARP  тест : {'СНИФФЕР ОБНАРУЖЕН' if arp_hits  else 'не обнаружен':30s}"
-              f"  ({arp_hits}/{repeat})")
-        print()
-        if detected:
-            print("  ⚠  ВЫВОД: Сетевой интерфейс хоста находится")
-            print(f"            в НЕРАЗБОРЧИВОМ РЕЖИМЕ — на нём работает СНИФФЕР!")
+        if kind == "not_promiscuous":
+            verdict = "Признаков неразборчивого режима не обнаружено"
+            suspicious = False
+        elif kind == "promiscuous":
+            verdict = message or "Вероятно, интерфейс работает в неразборчивом режиме"
+            suspicious = True
+        elif kind == "ambiguous":
+            verdict = message or "Неоднозначный результат"
+            suspicious = False
         else:
-            print("  ✓  ВЫВОД: Сниффер не обнаружен — интерфейс в нормальном режиме.")
-        print(f"{'═'*60}\n")
+            verdict = message or "Неизвестный результат"
+            suspicious = False
 
-        return detected
+        return ScanResult(
+            host=target,
+            signature=signature,
+            verdict=verdict,
+            suspicious=suspicious,
+        )
 
 
-# ------------------------------------------------------------------ #
-#  main                                                               #
-# ------------------------------------------------------------------ #
-
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Узел №2 — детектор сетевых снифферов (ICMP + ARP)')
-    parser.add_argument('target_ip', help='IP-адрес проверяемого хоста')
-    parser.add_argument('-i', '--interface', default='eth0',
-                        help='Сетевой интерфейс (по умолчанию: eth0)')
-    parser.add_argument('-n', '--repeat', type=int, default=1,
-                        help='Число повторений каждого теста (по умолчанию: 1)')
-    args = parser.parse_args()
+        description="Узел №2 — детектор снифферов по подсети (аналог sniffer-detect.nse)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Примеры:
+  sudo python3 node2_detector.py 192.168.1.0/24 -i eth0
+  sudo python3 node2_detector.py 192.168.100.42/32 -i eth0
 
+Смысл проверки:
+  Для каждого живого хоста отправляются ARP-запросы с разными Ethernet
+  dst MAC. Полученная сигнатура сравнивается с таблицей из NSE-скрипта.""",
+    )
+    parser.add_argument(
+        "target",
+        help="Подсеть или одиночный IPv4-адрес, например 192.168.1.0/24",
+    )
+    parser.add_argument(
+        "-i",
+        "--interface",
+        default="eth0",
+        help="Сетевой интерфейс (по умолчанию: eth0)",
+    )
+    parser.add_argument(
+        "--discovery-timeout",
+        type=float,
+        default=1.5,
+        help="Сколько ждать ARP-ответов на этапе поиска хостов, сек (по умолчанию: 1.5)",
+    )
+    parser.add_argument(
+        "--host-delay",
+        type=float,
+        default=0.002,
+        help="Пауза между ARP-запросами discovery, сек (по умолчанию: 0.002)",
+    )
+    return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> ipaddress.IPv4Network:
     if os.geteuid() != 0:
-        print("[!] Запустите с правами root:  sudo python3 node2_detector.py <IP>")
-        sys.exit(1)
-
-    print("=" * 60)
-    print("    УЗЕЛ №2 — ДЕТЕКТОР СЕТЕВЫХ СНИФФЕРОВ  (ICMP + ARP)")
-    print("=" * 60)
-
-    det = SnifferDetector(args.interface)
-    if not det.own_ip or not det.own_mac:
-        print(f"[!] Не удалось получить параметры интерфейса «{args.interface}».")
-        print(f"    Проверьте имя интерфейса: ip link show")
-        sys.exit(1)
-
-    sys.exit(0 if not det.run(args.target_ip, repeat=args.repeat) else 1)
+        raise DetectorError("Запустите с правами root: sudo python3 node2_detector.py <subnet>")
+    if args.discovery_timeout <= 0:
+        raise DetectorError("--discovery-timeout должен быть больше 0")
+    if args.host_delay < 0:
+        raise DetectorError("--host-delay не может быть отрицательным")
+    try:
+        network = ipaddress.ip_network(args.target, strict=False)
+    except ValueError as exc:
+        raise DetectorError(f"Некорректная подсеть или адрес: {args.target}") from exc
+    if network.version != 4:
+        raise DetectorError("Поддерживается только IPv4")
+    return network
 
 
-if __name__ == '__main__':
+def render_results(
+    interface: str,
+    local_ip: ipaddress.IPv4Address,
+    local_mac: bytes,
+    network: ipaddress.IPv4Network,
+    discovered: list[HostInfo],
+    results: list[ScanResult],
+) -> str:
+    suspicious = [item for item in results if item.suspicious]
+    unknown = [item for item in results if item.verdict == "Неизвестный результат"]
+    lines = [
+        "=" * 72,
+        "    УЗЕЛ №2 — ДЕТЕКТОР СНИФФЕРОВ ПО ПОДСЕТИ",
+        "=" * 72,
+        "",
+        f"  Интерфейс        : {interface}",
+        f"  Наш IP           : {local_ip}",
+        f"  Наш MAC          : {format_mac(local_mac)}",
+        f"  Сканируемая сеть : {network.with_prefixlen}",
+        f"  Найдено хостов   : {len(discovered)}",
+        "",
+    ]
+
+    if not discovered:
+        lines.append("  Живые хосты в подсети не обнаружены.")
+        lines.append("=" * 72)
+        return "\n".join(lines)
+
+    lines.append("  Результаты:")
+    for item in results:
+        lines.append(
+            f"  {str(item.host.ip):15}  {item.host.mac_text:17}  "
+            f"{item.verdict:42} tests=\"{item.signature}\""
+        )
+
+    lines.extend(
+        [
+            "",
+            "-" * 72,
+            f"  Подозрительных хостов : {len(suspicious)}",
+            f"  Неоднозначных сигнатур: {len(unknown)}",
+            "=" * 72,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def main() -> None:
+    args = parse_args()
+
+    try:
+        network = validate_args(args)
+        scanner = RawArpScanner(args.interface)
+    except DetectorError as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        if scanner.if_ip not in network:
+            raise DetectorError(
+                f"IP интерфейса {scanner.if_ip} не входит в подсеть {network.with_prefixlen}"
+            )
+
+        discovered = scanner.discover_hosts(
+            network,
+            per_host_delay=args.host_delay,
+            receive_timeout=args.discovery_timeout,
+        )
+        results = [scanner.fingerprint_host(host) for host in discovered]
+        print(
+            render_results(
+                args.interface,
+                scanner.if_ip,
+                scanner.if_mac,
+                network,
+                discovered,
+                results,
+            )
+        )
+    except DetectorError as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        sys.exit(2)
+    finally:
+        scanner.close()
+
+    sys.exit(1 if any(item.suspicious for item in results) else 0)
+
+
+if __name__ == "__main__":
     main()
