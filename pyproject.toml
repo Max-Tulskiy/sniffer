@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abks-sniffer"
+version = "0.1.0"
+description = "Educational cross-platform sniffer and sniffer detector for Linux and Windows"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+abks-sniffer = "sniffer_lab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sniffer_lab*"]

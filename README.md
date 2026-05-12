@@ -6,10 +6,15 @@
 
 | Узел | Файл | Назначение |
 |------|------|-----------|
-| **Узел №1** | `node1_sniffer.py` | Переводит NIC в неразборчивый режим (promiscuous mode), захватывает и анализирует весь трафик сети |
-| **Узел №2** | `node2_detector.py` | Сканирует подсеть и пытается определить хосты в promiscuous mode по ARP-эвристике, аналогичной `nmap` `sniffer-detect.nse` |
+| **Узел №1** | `abks-sniffer sniff` | Переводит NIC в неразборчивый режим (promiscuous mode), захватывает и анализирует весь трафик сети |
+| **Узел №2** | `abks-sniffer detect` | Сканирует подсеть и пытается определить хосты в promiscuous mode через ARP или ICMP |
 
-Зависимостей нет: только **Python 3** и стандартная библиотека.
+CLI сам определяет ОС и выбирает нужный backend:
+
+- Linux: raw socket `AF_PACKET` + `ioctl`;
+- Windows 10/11: Npcap/WinPcap API через `wpcap.dll`.
+
+Python-зависимостей нет: только **Python 3** и стандартная библиотека. На Windows отдельно нужен установленный **Npcap**.
 
 ---
 
@@ -19,18 +24,30 @@
 
 В обычном режиме NIC передаёт в ядро только фреймы, адресованные на MAC самого интерфейса и broadcast. В **promiscuous mode** все фреймы сети передаются в ядро без фильтрации.
 
-Программа переключает режим через системный вызов `ioctl` с флагом `IFF_PROMISC`.
+На Linux программа переключает режим через системный вызов `ioctl` с флагом `IFF_PROMISC`.
+На Windows интерфейс открывается в promiscuous mode через Npcap/WinPcap API.
 
 ### Обнаружение сниффера
 
-Детектор реализован по мотивам `sniffer-detect.nse` из `nmap`.
+Детектор поддерживает две механики:
 
-Схема работы такая:
+- `--arp` — ARP-эвристика по мотивам `sniffer-detect.nse` из `nmap`;
+- `--icmp` — ICMP Echo Request/Reply с тем же принципом подмены Ethernet `dst MAC`.
+
+Если ключ не указан, используется `--arp`.
+
+Схема ARP-проверки такая:
 
 1. Узел №2 получает список живых хостов в заданной IPv4-подсети обычными ARP-запросами.
 2. Для каждого найденного хоста отправляются 8 ARP-запросов с разными Ethernet `dst MAC`.
 3. Если цель отвечает на часть кадров, которые обычная NIC обычно должна отбросить на уровне Ethernet-фильтра, формируется сигнатура тестов вида `11111111`, `111___1_` и т.д.
 4. Сигнатура сравнивается с той же таблицей эвристик, что использует NSE-скрипт.
+
+Схема ICMP-проверки похожа:
+
+1. Узел №2 ищет живые хосты через ICMP Echo Request.
+2. Для каждого найденного хоста отправляются ICMP Echo Request в Ethernet-кадрах с разными `dst MAC`.
+3. Если хост отвечает на ICMP-запрос, пришедший в кадре с чужим MAC-адресом назначения, результат считается подозрительным.
 
 Это не абсолютно точный детект, а **эвристика**, поэтому возможны состояния:
 
@@ -43,11 +60,29 @@
 
 ## Требования
 
-- **ОС**: ALT Linux (или любой Linux с Python 3.10+)
-- **Python**: 3.10 или новее (используется `str | None` в аннотациях)
-- `node1_sniffer.py` требует `root` (raw sockets + ioctl)
-- `node2_detector.py` требует `root` (raw sockets)
+- **ОС**: Linux или Windows 10/11
+- **Python**: 3.9 или новее
+- Linux: для `sniff` нужен `root` (raw sockets + ioctl), для `detect` нужен `root` (raw sockets)
+- Windows: нужен установленный Npcap с WinPcap-compatible API; обычно запускать терминал нужно от администратора
 - **Сеть**: Узлы №1 и №2 должны быть в одной L2-сети (один коммутатор/патч-корд)
+
+### Установка
+
+```bash
+pip3 install .
+```
+
+После установки доступна команда:
+
+```bash
+abks-sniffer --help
+```
+
+### Npcap для Windows
+
+На Windows установите Npcap: https://npcap.com/
+
+При установке желательно включить опцию **WinPcap API-compatible Mode**, чтобы была доступна библиотека `wpcap.dll`.
 
 ---
 
@@ -86,13 +121,20 @@ ping 192.168.100.1   # с Узла №2
 
 ```bash
 # Узнать имя интерфейса
-sudo python3 node1_sniffer.py --list
+abks-sniffer list
 
 # Запустить захват (Ctrl+C для остановки)
-sudo python3 node1_sniffer.py -i eth0
+sudo abks-sniffer sniff -i eth0
 
 # Захватить ровно 50 пакетов и выйти
-sudo python3 node1_sniffer.py -i eth0 -n 50
+sudo abks-sniffer sniff -i eth0 -n 50
+```
+
+На Windows интерфейс имеет вид `\Device\NPF_{GUID}`. Его можно посмотреть командой:
+
+```powershell
+abks-sniffer list
+abks-sniffer sniff -i "\Device\NPF_{...}"
 ```
 
 #### Опции
@@ -109,10 +151,10 @@ sudo python3 node1_sniffer.py -i eth0 -n 50
 
 ```bash
 # Захватить трафик и сохранить в файл
-sudo python3 node1_sniffer.py -i eth0 -w capture.pcap
+sudo abks-sniffer sniff -i eth0 -w capture.pcap
 
 # Захватить 200 пакетов с подробным выводом и сохранить
-sudo python3 node1_sniffer.py -i eth0 -w capture.pcap -n 200 -v
+sudo abks-sniffer sniff -i eth0 -w capture.pcap -n 200 -v
 
 # Открыть результат в Wireshark
 wireshark capture.pcap
@@ -138,10 +180,26 @@ PCAP — стандартный бинарный формат (`libpcap`). Фа�
 
 ```bash
 # Проверить всю локальную /24-подсеть
-sudo python3 node2_detector.py 192.168.100.0/24 -i eth0
+sudo abks-sniffer detect 192.168.100.0/24 -i eth0 --arp
 
 # Проверить один хост тем же кодом
-sudo python3 node2_detector.py 192.168.100.1/32 -i eth0
+sudo abks-sniffer detect 192.168.100.1/32 -i eth0
+
+# Проверить подсеть через ICMP Echo
+sudo abks-sniffer detect 192.168.100.0/24 -i eth0 --icmp
+```
+
+На Windows:
+
+```powershell
+abks-sniffer detect 192.168.100.0/24 -i "\Device\NPF_{...}" --arp
+abks-sniffer detect 192.168.100.0/24 -i "\Device\NPF_{...}" --icmp
+```
+
+Если Windows не сможет автоматически сопоставить Npcap-интерфейс с IP/MAC адаптера:
+
+```powershell
+abks-sniffer detect 192.168.100.0/24 -i "\Device\NPF_{...}" --local-ip 192.168.100.2 --local-mac aa-bb-cc-dd-ee-ff
 ```
 
 #### Опции
@@ -150,8 +208,12 @@ sudo python3 node2_detector.py 192.168.100.1/32 -i eth0
 |------|----------|-------------|
 | `target` | Подсеть или одиночный IPv4-адрес (`192.168.1.0/24`, `192.168.1.10/32`) | (обязательный) |
 | `-i`, `--interface` | Сетевой интерфейс | `eth0` |
-| `--discovery-timeout` | Сколько ждать ARP-ответов на этапе поиска хостов | `1.5` |
-| `--host-delay` | Пауза между ARP-запросами discovery, сек | `0.002` |
+| `--arp` | Использовать ARP-механику детекта | вкл. |
+| `--icmp` | Использовать ICMP Echo-механику детекта | выкл. |
+| `--discovery-timeout` | Сколько ждать ответов на этапе поиска хостов | `1.5` |
+| `--host-delay` | Пауза между discovery-запросами, сек | `0.002` |
+| `--local-ip` | Windows fallback: IPv4 выбранного интерфейса | — |
+| `--local-mac` | Windows fallback: MAC выбранного интерфейса | — |
 
 #### Коды завершения
 
@@ -199,6 +261,7 @@ sudo python3 node2_detector.py 192.168.100.1/32 -i eth0
 ========================================================================
 
   Интерфейс        : eth0
+  Метод            : ARP
   Наш IP           : 192.168.100.2
   Наш MAC          : aa:bb:cc:dd:ee:ff
   Сканируемая сеть : 192.168.100.0/24
@@ -220,8 +283,18 @@ sudo python3 node2_detector.py 192.168.100.1/32 -i eth0
 
 ```
 abks_lab4/
-├── node1_sniffer.py    # Узел №1: сниффер
-├── node2_detector.py   # Узел №2: детектор
+├── pyproject.toml
+├── setup.cfg
+├── sniffer_lab/
+│   ├── cli.py          # общий CLI
+│   ├── common.py       # разбор Ethernet/IP/TCP/UDP/ICMP/ARP и PCAP writer
+│   ├── linux/
+│   │   ├── sniffer.py
+│   │   └── detector.py
+│   └── windows/
+│       ├── npcap.py
+│       ├── sniffer.py
+│       └── detector.py
 └── README.md
 ```
 
@@ -246,11 +319,11 @@ python3 --version
 1. Соединить Узлы №1 и №2 в локальную сеть, назначить IP-адреса.
 2. **На Узле №1** запустить сниффер:
    ```bash
-   sudo python3 node1_sniffer.py -i eth0
+   sudo abks-sniffer sniff -i eth0
    ```
 3. **На Узле №2** запустить детектор:
    ```bash
-   sudo python3 node2_detector.py 192.168.100.0/24 -i eth0
+   sudo abks-sniffer detect 192.168.100.0/24 -i eth0 --arp
    ```
 4. Убедиться, что:
    - Узел №2 находит хост `192.168.100.1` в подсети.
