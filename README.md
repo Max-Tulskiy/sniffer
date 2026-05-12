@@ -78,6 +78,21 @@ pip3 install .
 abks-sniffer --help
 ```
 
+На Windows `pip` может установить `abks-sniffer.exe` в папку `Scripts`, которая не добавлена в `PATH`.
+В этом случае используйте модульный запуск:
+
+```powershell
+python -m sniffer_lab --help
+python -m sniffer_lab list
+python -m sniffer_lab detect 192.168.100.0/24 --icmp
+```
+
+Или добавьте папку из предупреждения pip в переменную `PATH`, например:
+
+```powershell
+$env:Path += ";C:\Users\maxim\AppData\Local\Python\pythoncore-3.14-64\Scripts"
+```
+
 ### Npcap для Windows
 
 На Windows установите Npcap: https://npcap.com/
