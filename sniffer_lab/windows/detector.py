@@ -413,15 +413,15 @@ class NpcapIcmpScanner:
 
     def fingerprint_host(self, target: HostInfo) -> ScanResult:
         signature = "".join(self.do_test(target, dst_mac) for dst_mac in TEST_DEST_MACS)
-        if any(bit == "1" for bit in signature[1:]):
-            verdict = "Вероятно, хост отвечает на ICMP-кадры с чужим Ethernet dst MAC"
-            suspicious = True
-        elif signature.startswith("1"):
-            verdict = "Признаков неразборчивого режима по ICMP не обнаружено"
-            suspicious = False
+        kind, message = SIGNATURES.get(signature, ("unknown", "Неизвестный результат ICMP-проверки"))
+        if kind == "not_promiscuous":
+            verdict, suspicious = "Признаков неразборчивого режима по ICMP не обнаружено", False
+        elif kind == "promiscuous":
+            verdict, suspicious = message or "Вероятно, интерфейс работает в неразборчивом режиме", True
+        elif kind == "ambiguous":
+            verdict, suspicious = message or "Неоднозначный результат", False
         else:
-            verdict = "Неизвестный результат ICMP-проверки"
-            suspicious = False
+            verdict, suspicious = message or "Неизвестный результат ICMP-проверки", False
         return ScanResult(host=target, signature=signature, verdict=verdict, suspicious=suspicious)
 
 
